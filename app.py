@@ -121,12 +121,18 @@ def observations_df() -> pd.DataFrame:
     return pd.DataFrame(ss.observations, columns=COLUMNS)
 
 
+def to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """CSV « séparateur point-virgule » (format Excel FR / read.csv2 de R) :
+    séparateur ';', décimale ',', UTF-8 avec BOM pour que Excel lise les accents."""
+    return df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+
+
 def autosave() -> None:
     """Copie de secours sur disque (échec silencieux : ne doit jamais bloquer)."""
     try:
         AUTOSAVE_DIR.mkdir(exist_ok=True)
         path = AUTOSAVE_DIR / f"{slug(ss.get('cfg_session', 'session'))}.csv"
-        observations_df().to_csv(path, index=False)
+        path.write_bytes(to_csv_bytes(observations_df()))
     except OSError:
         pass
 
@@ -404,6 +410,6 @@ with tab_obs:
               width="stretch", disabled=df.empty)
     d2.download_button(
         "⬇️ Télécharger les données (CSV)",
-        data=df.to_csv(index=False).encode("utf-8"),
+        data=to_csv_bytes(df),
         file_name=f"{slug(ss.cfg_session)}_{datetime.now():%Y%m%d_%H%M}.csv",
         mime="text/csv", width="stretch", disabled=df.empty)
