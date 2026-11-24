@@ -72,10 +72,15 @@ st.markdown(
 def init_state() -> None:
     defaults = {
         "observations": [],      # liste de dicts (une par observation)
-        "scan_num": 0,           # 0 = scan sampling pas encore démarré
-        "timer_running": False,
-        "timer_deadline": 0.0,   # instant (time.time()) où le scan se termine
-        "timer_remaining": None, # secondes restantes quand le chrono est en pause
+        # Horloge de SESSION continue (elle ne se remet jamais à zéro entre scans)
+        "session_started": False,
+        "session_ended": False,
+        "clock_running": False,
+        "clock_start": 0.0,      # instant (time.time()) de la dernière (re)prise
+        "clock_accum": 0.0,      # secondes écoulées avant la dernière reprise
+        "session_interval": 60,  # intervalle figé au démarrage de la session
+        "scan_individus": [],    # individus figés au démarrage (pour les lignes NA)
+        "rendered_scan": 0,      # scan affiché lors du dernier rendu complet
         "sel_ind": None,         # sélections en cours
         "sel_beh": None,
         "sel_mod": None,
@@ -101,16 +106,33 @@ def parse_list(text: str) -> list[str]:
 
 
 def interval_s() -> int:
-    return int(ss.get("cfg_interval", 60))
+    """Intervalle de scan (figé une fois la session démarrée)."""
+    return int(ss.session_interval if ss.session_started else ss.get("cfg_interval", 60))
 
 
-def remaining_s() -> float:
-    """Secondes restantes dans le scan courant."""
-    if ss.scan_num == 0:
-        return float(interval_s())
-    if ss.timer_running:
-        return max(0.0, ss.timer_deadline - time.time())
-    return float(ss.timer_remaining if ss.timer_remaining is not None else interval_s())
+def elapsed_s() -> float:
+    """Secondes écoulées depuis le début de la session (pauses exclues)."""
+    if ss.clock_running:
+        return ss.clock_accum + (time.time() - ss.clock_start)
+    return ss.clock_accum
+
+
+def current_scan() -> int:
+    """N° du scan en cours : le scan 1 couvre [0, intervalle[, le 2 [intervalle, 2x[..."""
+    if not ss.session_started:
+        return 0
+    return int(elapsed_s() // interval_s()) + 1
+
+
+def closed_scans() -> int:
+    """Nombre de scans terminés. Le scan en cours n'est pas « fermé » (on peut encore
+    le remplir) ; à la fin de session, il n'est gardé que s'il contient une saisie."""
+    n = current_scan()
+    if n == 0:
+        return 0
+    if ss.session_ended and any(o["Scan_Num"] == n for o in ss.observations):
+        return n
+    return n - 1
 
 
 def slug(text: str) -> str:
@@ -118,7 +140,23 @@ def slug(text: str) -> str:
 
 
 def observations_df() -> pd.DataFrame:
-    return pd.DataFrame(ss.observations, columns=COLUMNS)
+    """Tableau complet : saisies + lignes NA pour chaque (scan terminé, individu)
+    sans saisie. Une seule ligne par scan et par individu."""
+    rows = list(ss.observations)
+    done = {(o["Scan_Num"], o["Individu"]) for o in rows}
+    for n in range(1, closed_scans() + 1):
+        for ind in ss.scan_individus:
+            if (n, ind) not in done:
+                rows.append({"Session": ss.get("cfg_session", ""),
+                             "Observateur": ss.get("cfg_observer", ""),
+                             "Scan_Num": n, "Timestamp": None, "Individu": ind,
+                             "Comportement": None, "Modificateur": None,
+                             "X_norm": None, "Y_norm": None})
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    rank = {ind: i for i, ind in enumerate(ss.scan_individus)}
+    df["_r"] = df["Individu"].map(rank).fillna(len(rank))
+    df = df.sort_values(["Scan_Num", "_r"], kind="stable").drop(columns="_r")
+    return df.reset_index(drop=True)
 
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -172,23 +210,24 @@ def render_image_with_markers(base: Image.Image, show_all: bool) -> Image.Image:
 # Callbacks (s'exécutent avant le rerun)
 # --------------------------------------------------------------------------- #
 def start_or_resume() -> None:
-    if ss.scan_num == 0:                       # tout premier démarrage
-        ss.scan_num = 1
-        ss.timer_remaining = float(interval_s())
-    ss.timer_deadline = time.time() + ss.timer_remaining
-    ss.timer_running = True
+    if not ss.session_started:                 # tout premier démarrage
+        ss.session_started = True
+        ss.session_interval = int(ss.cfg_interval)
+        ss.scan_individus = parse_list(ss.cfg_individus)
+        ss.clock_accum = 0.0
+    ss.clock_start = time.time()
+    ss.clock_running = True
 
 
 def pause() -> None:
-    ss.timer_remaining = remaining_s()
-    ss.timer_running = False
+    ss.clock_accum = elapsed_s()
+    ss.clock_running = False
 
 
-def next_scan() -> None:
-    ss.scan_num += 1
-    ss.timer_remaining = float(interval_s())
-    ss.timer_deadline = time.time() + ss.timer_remaining
-    ss.timer_running = True
+def end_session() -> None:
+    pause()
+    ss.session_ended = True
+    ss.flash = ("info", "Session terminée. Téléchargez le CSV en bas de page.")
 
 
 def choose(state_key: str, option: str, optional: bool) -> None:
@@ -200,17 +239,26 @@ def choose(state_key: str, option: str, optional: bool) -> None:
 
 
 def save_observation() -> None:
-    if ss.scan_num == 0:
-        ss.flash = ("error", "Démarrez le scan (▶ Démarrer) avant d'enregistrer.")
+    if not ss.session_started:
+        ss.flash = ("error", "Démarrez la session (▶) avant d'enregistrer.")
+        return
+    if ss.session_ended:
+        ss.flash = ("error", "La session est terminée.")
         return
     if not (ss.sel_ind and ss.sel_beh):
         ss.flash = ("error", "Choisissez au moins un individu et un comportement.")
         return
     pt = ss.last_click
+    scan = current_scan()   # scan en cours AU MOMENT du clic sur « Enregistrer »
+    # Une seule ligne par (scan, individu) : une saisie existante est remplacée.
+    replaced = any(o["Scan_Num"] == scan and o["Individu"] == ss.sel_ind
+                   for o in ss.observations)
+    ss.observations = [o for o in ss.observations
+                       if not (o["Scan_Num"] == scan and o["Individu"] == ss.sel_ind)]
     ss.observations.append({
         "Session": ss.cfg_session,
         "Observateur": ss.cfg_observer,
-        "Scan_Num": ss.scan_num,
+        "Scan_Num": scan,
         "Timestamp": datetime.now().astimezone().isoformat(timespec="milliseconds"),
         "Individu": ss.sel_ind,
         "Comportement": ss.sel_beh,
@@ -218,9 +266,10 @@ def save_observation() -> None:
         "X_norm": pt["x"] if pt else None,
         "Y_norm": pt["y"] if pt else None,
     })
-    ss.flash = ("success", f"✅ Enregistré : {ss.sel_ind} · {ss.sel_beh}"
-                           + (" · position" if pt else " · SANS position"))
-    # On remet à zéro les sélections ET le point : évite de réutiliser par erreur
+    ss.flash = ("success", f"✅ Scan {scan} : {ss.sel_ind} · {ss.sel_beh}"
+                           + (" · position" if pt else " · SANS position")
+                           + (" (remplace la saisie précédente)" if replaced else ""))
+    # Remise à zéro des sélections ET du point : évite de réutiliser par erreur
     # la position de l'individu précédent.
     ss.sel_ind = ss.sel_beh = ss.sel_mod = None
     ss.last_click = None
@@ -236,9 +285,9 @@ def delete_last() -> None:
 
 def reset_session() -> None:
     ss.observations = []
-    ss.scan_num = 0
-    ss.timer_running = False
-    ss.timer_remaining = None
+    ss.session_started = ss.session_ended = ss.clock_running = False
+    ss.clock_accum = 0.0
+    ss.scan_individus = []
     ss.sel_ind = ss.sel_beh = ss.sel_mod = None
     ss.last_click = None
     ss.cfg_confirm_reset = False
@@ -257,7 +306,9 @@ with tab_cfg:
     c1.text_input("Nom de la session", value="Session_1", key="cfg_session")
     c2.text_input("Observateur", value="", key="cfg_observer")
     c3.number_input("Intervalle de scan (s)", min_value=5, max_value=3600,
-                    value=60, step=5, key="cfg_interval")
+                    value=60, step=5, key="cfg_interval",
+                    disabled=ss.session_started,
+                    help="Verrouillé une fois la session démarrée.")
 
     st.subheader("Listes (une entrée par ligne, modifiables à tout moment)")
     l1, l2, l3 = st.columns(3)
@@ -295,54 +346,71 @@ for key, options in (("sel_ind", individus), ("sel_beh", comportements),
 
 
 def button_grid(options: list[str], state_key: str, optional: bool = False,
-                n_cols: int = 3) -> None:
-    """Grille de gros boutons ; le bouton sélectionné est en couleur pleine."""
+                n_cols: int = 3, marked: set | None = None) -> None:
+    """Grille de gros boutons ; le bouton sélectionné est en couleur pleine.
+    `marked` : options déjà saisies dans ce scan (affichées avec ✓)."""
     if not options:
         st.warning("Liste vide : ajoutez des entrées dans l'onglet Configuration.")
         return
+    marked = marked or set()
     for start in range(0, len(options), n_cols):
         cols = st.columns(n_cols)
         for col, opt in zip(cols, options[start:start + n_cols]):
-            col.button(opt, key=f"{state_key}__{opt}", width="stretch",
+            col.button(f"{opt} ✓" if opt in marked else opt,
+                       key=f"{state_key}__{opt}", width="stretch",
                        type="primary" if ss[state_key] == opt else "secondary",
                        on_click=choose, args=(state_key, opt, optional))
 
 
 def timer_display() -> None:
-    """Affichage du chrono (rafraîchi chaque seconde sans relancer toute la page)."""
-    rem = remaining_s()
-    expired = ss.scan_num > 0 and rem <= 0
-    mm, sec = divmod(math.ceil(rem), 60)
-    if ss.scan_num == 0:
+    """Chrono de session continu, rafraîchi chaque seconde (sans relancer la page)."""
+    # Nouveau scan : on relance toute la page pour mettre à jour les ✓ des individus.
+    if ss.clock_running and current_scan() != ss.rendered_scan:
+        st.rerun()
+    itv, el = interval_s(), elapsed_s()
+    in_scan = el % itv if ss.session_started else 0.0
+    left = itv - in_scan                       # temps restant avant le prochain scan
+    mm, sec = divmod(int(el), 60)
+    lm, ls = divmod(math.ceil(left), 60)
+    if not ss.session_started:
         status = "Non démarré"
-    elif expired:
-        status = "⏰ Scan terminé : passez au scan suivant"
+    elif ss.session_ended:
+        status = "Session terminée"
+    elif not ss.clock_running:
+        status = "⏸ En pause"
     else:
-        status = "En cours" if ss.timer_running else "⏸ En pause"
+        status = "En cours"
+    warn = ss.clock_running and left <= 3      # dernières secondes du scan
     st.markdown(
-        f'<div class="timer-box{" expired" if expired else ""}">'
-        f'<div class="label">Scan n° {ss.scan_num} · {status}</div>'
-        f'<div class="time">{mm:02d}:{sec:02d}</div></div>',
+        f'<div class="timer-box{" expired" if warn else ""}">'
+        f'<div class="label">Scan n° {current_scan()} · {status}</div>'
+        f'<div class="time">{lm:02d}:{ls:02d}</div>'
+        f'<div class="label">avant le scan suivant · session {mm:02d}:{sec:02d}</div></div>',
         unsafe_allow_html=True)
-    st.progress(min(1.0, max(0.0, 1 - rem / max(1, interval_s()))))
+    st.progress(min(1.0, max(0.0, in_scan / max(1, itv))))
 
 
 # ============================== OBSERVATION ================================ #
 with tab_obs:
-    # --- Chrono + contrôles ------------------------------------------------ #
+    ss.rendered_scan = current_scan()
+    # --- Chrono de session + contrôles ------------------------------------- #
     t_col, b_col = st.columns([2, 3])
     with t_col:
         # run_every=1 uniquement quand le chrono tourne (pas de rerun inutile)
-        st.fragment(timer_display, run_every=1 if ss.timer_running else None)()
+        st.fragment(timer_display, run_every=1 if ss.clock_running else None)()
     with b_col:
         b1, b2 = st.columns(2)
-        if ss.timer_running:
+        if ss.session_ended:
+            b1.button("Session terminée", disabled=True, width="stretch")
+        elif ss.clock_running:
             b1.button("⏸ Pause", on_click=pause, width="stretch")
         else:
-            b1.button("▶ Démarrer" if ss.scan_num == 0 else "▶ Reprendre",
+            b1.button("▶ Démarrer la session" if not ss.session_started else "▶ Reprendre",
                       on_click=start_or_resume, width="stretch", type="primary")
-        b2.button("⏭ Scan suivant", on_click=next_scan, width="stretch",
-                  disabled=ss.scan_num == 0)
+        with b2.popover("⏹ Terminer la session", width="stretch",
+                        disabled=(not ss.session_started) or ss.session_ended):
+            st.write("Terminer définitivement la session ?")
+            st.button("Oui, terminer", on_click=end_session, width="stretch")
 
     if ss.flash:
         getattr(st, ss.flash[0])(ss.flash[1])
@@ -380,7 +448,9 @@ with tab_obs:
     # --- Sélection Individu → Comportement → Modificateur ------------------ #
     with right:
         st.markdown("#### 1️⃣ Individu")
-        button_grid(individus, "sel_ind")
+        button_grid(individus, "sel_ind", marked={
+            o["Individu"] for o in ss.observations
+            if o["Scan_Num"] == current_scan()})
         st.markdown("#### 2️⃣ Comportement")
         button_grid(comportements, "sel_beh")
         st.markdown("#### 3️⃣ Modificateur (facultatif)")
@@ -403,11 +473,13 @@ with tab_obs:
     if df.empty:
         st.caption("Aucune observation enregistrée pour l'instant.")
     else:
+        st.caption("Les lignes sans comportement correspondent à des scans non "
+                   "renseignés (NA dans le CSV).")
         st.dataframe(df.set_index(df.index + 1), width="stretch", height=300)
 
     d1, d2 = st.columns(2)
-    d1.button("🗑️ Supprimer la dernière ligne", on_click=delete_last,
-              width="stretch", disabled=df.empty)
+    d1.button("🗑️ Supprimer la dernière saisie", on_click=delete_last,
+              width="stretch", disabled=not ss.observations)
     d2.download_button(
         "⬇️ Télécharger les données (CSV)",
         data=to_csv_bytes(df),
